@@ -1,6 +1,7 @@
 # Offshore Wind–Aquaculture Digital Twin Dashboard
 # by Johannes Pein, Helmholtz-Zentrum hereon
 # johannes.pein@hereon.de
+# Website: https://offshore-co-use-dashboard.streamlit.app
 
 ## Overview
 
