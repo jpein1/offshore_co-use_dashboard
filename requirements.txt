@@ -1,0 +1,13 @@
+streamlit>=1.45
+streamlit-folium>=0.25
+folium>=0.20
+rasterio>=1.4
+numpy>=2.0
+pandas>=2.2
+matplotlib>=3.10
+altair>=5.5
+branca>=0.8
+pyproj>=3.7
+shapely>=2.1
+geopandas>=1.1
+pyarrow>=20
