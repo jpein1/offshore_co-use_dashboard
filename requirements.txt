@@ -29,7 +29,8 @@ pmtiles
 folium-pmtiles
 
 pyyaml
-global-land-maskstreamlit
+global-land-mask 
+streamlit
 streamlit-folium
 folium
 branca
