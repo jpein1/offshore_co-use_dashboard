@@ -274,9 +274,9 @@ and
 
 # License
 
-This repository is distributed under the MIT License unless stated otherwise.
+This software is licensed under the Apache License 2.0.
 
----
+See the LICENSE file for details.
 
 # Contact
 
