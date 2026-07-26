@@ -20,6 +20,66 @@ from jinja2 import Template
 import branca.colormap as cm
 import matplotlib.colors as mcolors
 from rasterio.warp import reproject, Resampling
+from rasterio.transform import rowcol
+from scipy.ndimage import gaussian_filter
+#from rasterio.transform import rowcol
+
+VARIABLE_INFO = {
+
+    "chla": {
+        "name": "Chlorophyll-a concentration",
+        "unit": "mg m⁻³",
+        "description": "Indicator of phytoplankton biomass.",
+    },
+
+    "chlorophyll": {
+        "name": "Chlorophyll-a concentration",
+        "unit": "mg m⁻³",
+        "description": "Indicator of phytoplankton biomass.",
+    },
+
+    "oxy": {
+        "name": "Dissolved oxygen concentration",
+        "unit": "mmol m⁻³",
+        "description": "Dissolved oxygen concentration in seawater.",
+    },
+
+    "oxygen": {
+        "name": "Dissolved oxygen concentration",
+        "unit": "mmol m⁻³",
+        "description": "Dissolved oxygen concentration in seawater.",
+    },
+
+    "salt": {
+        "name": "Salinity",
+        "unit": "PSU",
+        "description": "Practical salinity of seawater.",
+    },
+
+    "salinity": {
+        "name": "Salinity",
+        "unit": "PSU",
+        "description": "Practical salinity of seawater.",
+    },
+
+    "temp": {
+        "name": "Temperature",
+        "unit": "°C",
+        "description": "Sea water temperature.",
+    },
+
+    "temperature": {
+        "name": "Temperature",
+        "unit": "°C",
+        "description": "Sea water temperature.",
+    },
+
+    "mussel_weight": {
+        "name": "Blue mussel fresh weight",
+        "unit": "g individual⁻¹",
+        "description": "Predicted biomass from the DEB model.",
+    },
+}
 
 def _rgba_to_data_url(rgba: np.ndarray) -> str:
     im = Image.fromarray(rgba, mode="RGBA")
@@ -27,18 +87,24 @@ def _rgba_to_data_url(rgba: np.ndarray) -> str:
     im.save(buf, format="PNG", optimize=True)
     return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('ascii')}"
 
-def _clean(arr, src):
+def _clean(arr, src, variable=None):
+
     arr = arr.astype(np.float32)
 
     if src.nodata is not None:
         arr = np.where(arr == src.nodata, np.nan, arr)
 
     arr = np.where(np.isfinite(arr), arr, np.nan)
-    return arr
 
+    # Remove undeclared fill values
+    arr = np.where(np.abs(arr) > 1e30, np.nan, arr)
+
+    return arr
 def _render_preview_from_tif(
-    tif_bytes: bytes, *, max_size: int = 1024
-#) -> Tuple[np.ndarray, Tuple[float, float, float, float], dict]:
+    tif_bytes: bytes,
+    turbine_df: pd.DataFrame,
+    *,
+    max_size: int = 1024,
 ) -> Tuple[
     np.ndarray,
     Tuple[float, float, float, float],
@@ -46,6 +112,7 @@ def _render_preview_from_tif(
     float,
     float,
 ]:
+
     with MemoryFile(tif_bytes) as mem:
         with mem.open() as src:
             if src.crs is None or str(src.crs).upper() != "EPSG:4326":
@@ -64,8 +131,11 @@ def _render_preview_from_tif(
             east = max(src.bounds.left, src.bounds.right)
             south = min(src.bounds.bottom, src.bounds.top)
             north = max(src.bounds.bottom, src.bounds.top)
+            transform = src.transform
+
             if src.transform.e > 0:
                 data = data[..., ::-1, :]
+            
 
     if data.shape[0] >= 3:
         rgb = np.stack([data[0], data[1], data[2]], axis=-1).astype(np.float32)
@@ -98,15 +168,51 @@ def _render_preview_from_tif(
         mask = ~np.isfinite(band)
 
 # --- robust percentiles ---
-        vmin = np.nanpercentile(band, 5)
-        vmax = np.nanpercentile(band, 95)
+#        vmin = np.nanpercentile(band, 5)
+#        vmax = np.nanpercentile(band, 95)
 
-# --- safety fallback ---
-        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
-            vmin, vmax = np.nanmin(band), np.nanmax(band)
+        # --------------------------------------------------
+# Compute colour scale only around the OWF
+# --------------------------------------------------
 
-        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
-            vmin, vmax = 0.0, 1.0
+
+
+        buffer_deg = 0.05
+
+        min_lon = turbine_df["lon"].min() - buffer_deg
+        max_lon = turbine_df["lon"].max() + buffer_deg
+
+        min_lat = turbine_df["lat"].min() - buffer_deg
+        max_lat = turbine_df["lat"].max() + buffer_deg
+
+# Convert lon/lat -> raster rows/cols
+        r0, c0 = rowcol(transform, min_lon, max_lat)
+        r1, c1 = rowcol(transform, max_lon, min_lat)
+
+        r0, r1 = sorted((r0, r1))
+        c0, c1 = sorted((c0, c1))
+
+# Keep indices inside raster
+        r0 = max(r0, 0)
+        c0 = max(c0, 0)
+
+        r1 = min(r1, band.shape[0])
+        c1 = min(c1, band.shape[1])
+
+        window = band[r0:r1, c0:c1]
+
+        vmin = np.nanpercentile(window, 5)
+        vmax = np.nanpercentile(window, 95)
+
+# Fall back to whole raster if window is empty
+        if (
+            not np.isfinite(vmin)
+            or not np.isfinite(vmax)
+            or vmin == vmax
+        ):
+            vmin = np.nanpercentile(band, 5)
+            vmax = np.nanpercentile(band, 95)
+
 
 # --- render ALWAYS (not inside fallback!) ---
         norm = mcolors.Normalize(vmin=vmin, vmax=vmax, clip=True)
@@ -172,8 +278,52 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("OWF & LTA co-use dashboard")
+#st.title("OWF & LTA co-use dashboard")
+st.title("Offshore Co-use Decision Dashboard")
 st.caption("Mussel biomass, scenarios, and spatial analysis viewer")
+
+
+with st.expander("ℹ About this application", expanded=False):
+
+    st.markdown("""
+### Why?
+
+This digital twin demonstrates how offshore wind farms and low-trophic
+aquaculture can be planned jointly using scenario-based environmental
+simulations.
+
+The application supports transparent comparison of alternative offshore
+co-use scenarios and illustrates the role of environmental digital twins
+for adaptive marine spatial planning.
+
+---
+
+### What?
+
+The dashboard visualizes outputs from a coupled
+
+- Hydrodynamic model
+- Wave model
+- Biogeochemical model
+- Dynamic Energy Budget (DEB) mussel growth model
+
+for the Meerwind Offshore Wind Farm (German Bight).
+
+Users can compare scenarios, variables and simulation dates to evaluate
+aquaculture performance and environmental response.
+
+---
+
+### How?
+
+The workflow consists of
+
+Hydrodynamic forcing
+→ Ecosystem simulation
+→ Mussel growth modelling
+→ Raster generation
+→ Interactive visualization in Streamlit.
+""")
 
 base_dir = Path(__file__).parent
 
@@ -330,19 +480,25 @@ with st.sidebar:
 
     else:
     # Biology GeoTIFFs
+        if selected_source == "Baseline":
 
-        if scenario is None:
-        # default biology reference
-            folder_scenario = "ScenM0"
+            folder_scenario = "Baseline"
+
         else:
-            folder_scenario = SCENARIO_TO_FOLDER[scenario]
 
-        df_var = df_files[
-            (df_files["variable"] == selected_var) &
-            (df_files["source"] == "Scenario") &
-            (df_files["scenario"] == folder_scenario)
-        ]
+            if scenario is None:
+                folder_scenario = "ScenM0"     # default until user picks one
+            else:
+                folder_scenario = SCENARIO_TO_FOLDER[scenario]
 
+       
+            df_var = df_files[
+                (df_files["variable"] == selected_var) &
+                (df_files["source"] == "Scenario") &
+                (df_files["scenario"] == folder_scenario)
+            ]
+
+        
     if df_var.empty:
         st.error(
             f"No GeoTIFFs found for:\n"
@@ -351,7 +507,10 @@ with st.sidebar:
             f"Scenario = {folder_scenario}"
         )
         st.stop()
-   
+
+# Metadata for currently displayed raster
+    scenario_name = "Baseline" if selected_source == "Baseline" else folder_scenario
+
 
 # Ensure time column is datetime
     df_var = df_var.copy()
@@ -368,10 +527,6 @@ with st.sidebar:
         options=times,
         value=times.iloc[0]
     )
-    is_last_time = np.isclose(
-        pd.Timestamp(selected_time).value,
-        pd.Timestamp(times.iloc[-1]).value
-    )
 
     idx = (
         df_var["time"] - pd.Timestamp(selected_time)
@@ -379,6 +534,8 @@ with st.sidebar:
 
     selected_row = df_var.loc[idx]
     selected_tif = selected_row["file"]
+
+
 
     st.write("Selected file:", selected_tif.name)
 
@@ -409,42 +566,56 @@ SCENARIO_COLORS = {
 }
 
 # defaults (no scenario selected)
+# defaults
 ts_df = pd.DataFrame(columns=["time", "value", "lon", "lat"])
 point_df = pd.DataFrame(columns=["lon", "lat", "value_latest", "time_latest"])
 avg_ts = pd.DataFrame(columns=["time", "value"])
 
-if scenario is None:
-    st.info("Select a scenario to display GeoJSON points and time series.")
-else:
-    geojson_path = geojson_files[scenario]
+if selected_source == "Scenario":
 
-    if not geojson_path.exists():
-        st.error(f"GeoJSON file not found: {geojson_path}")
+    if scenario is None:
+        st.info("Select a scenario to display GeoJSON points and time series.")
+
     else:
-        ts_df = _cached_load_geojson_timeseries(str(geojson_path))
+        geojson_path = geojson_files[scenario]
 
-        if not ts_df.empty:
-            ts_df["time"] = pd.to_datetime(ts_df["time"])
+        if not geojson_path.exists():
+            st.error(f"GeoJSON file not found: {geojson_path}")
 
-            avg_ts = (
-                ts_df.groupby("time", as_index=False)["value"]
-                .mean()
-                .sort_values("time")
-            )
+        else:
+            ts_df = _cached_load_geojson_timeseries(str(geojson_path))
 
-            point_df = (
-                ts_df.sort_values("time")
-                .groupby(["lon", "lat"], as_index=False)
-                .agg(
-                    value_latest=("value", "last"),
-                    time_latest=("time", "last")
+            if not ts_df.empty:
+                ts_df["time"] = pd.to_datetime(ts_df["time"])
+                selected_time_pd = pd.Timestamp(selected_time)
+
+                ts_df_current = ts_df[
+                    ts_df["time"] <= selected_time
+                ].copy()
+
+                avg_ts = (
+                    ts_df_current.groupby("time", as_index=False)["value"]
+                    .mean()
+                    .sort_values("time")
                 )
-            )
+
+
+                point_df = (
+                    ts_df_current
+                    .sort_values("time")
+                    .groupby(["lon", "lat"], as_index=False)
+                    .agg(
+                        value_latest=("value", "last"),
+                        time_latest=("time", "last"),
+                    )
+                )
+
 
 # --- MULTI-SCENARIO AGGREGATION (NEW) ---
 all_avg_ts = {}
 
 for scen in st.session_state.selected_scenarios:
+
     geojson_path = geojson_files[scen]
 
     if not geojson_path.exists():
@@ -456,54 +627,120 @@ for scen in st.session_state.selected_scenarios:
         continue
 
     ts_df_tmp["time"] = pd.to_datetime(ts_df_tmp["time"])
+    ts_df_tmp["value"] = pd.to_numeric(ts_df_tmp["value"], errors="coerce")
 
     avg_tmp = (
-        ts_df_tmp.groupby("time", as_index=False)["value"]
+        ts_df_tmp
+        .groupby("time", as_index=False)["value"]
         .mean()
         .sort_values("time")
     )
-    #avg_tmp = avg_tmp.rename(columns={"value": "harvest"})
-    
- #   MIN_BIOMASS = 0.003
 
-  #  avg_tmp["value"] = pd.to_numeric(avg_tmp["value"], errors="coerce")
+    # Number of monopiles / farm locations
+    N_FARMS = (
+        ts_df_tmp[["lon", "lat"]]
+        .drop_duplicates()
+        .shape[0]
+    )
 
-# THIS is the important place
-   # avg_tmp["value"] = avg_tmp["value"].clip(lower=MIN_BIOMASS)
-
-    #avg_tmp["value"] = pd.to_numeric(avg_tmp["value"], errors="coerce")
-    # harvest calculation
-    N_FARMS = ts_df_tmp[["lon", "lat"]].drop_duplicates().shape[0]
-    avg_tmp["harvest"] = avg_tmp["value"] * N_FARMS 
+    # Estimated harvest
+    avg_tmp["harvest"] = avg_tmp["value"] * N_FARMS
 
     all_avg_ts[scen] = avg_tmp
 
 @st.cache_data(show_spinner=False)
-def _load_tif_cached(path_str: str):
+def _load_tif_cached(path_str: str, turbine_df):
     path = Path(path_str)
     tif_bytes = path.read_bytes()
-    return _render_preview_from_tif(tif_bytes, max_size=1024)
+    return _render_preview_from_tif(tif_bytes, turbine_df, max_size=1024)
     
-def _render_diff_rgba(diff: np.ndarray) -> np.ndarray:
+#def _render_diff_rgba(diff: np.ndarray) -> np.ndarray:
+def _render_diff_rgba(
+    diff: np.ndarray,
+    transform,
+    turbine_df: pd.DataFrame,
+) -> tuple[np.ndarray, float]:
     """
     Render a signed difference raster with red-blue diverging colormap.
     Positive = red, negative = blue, near zero = white/grey.
     """
+
+    buffer_deg = 0.05
+
+    min_lon = turbine_df["lon"].min() - buffer_deg
+    max_lon = turbine_df["lon"].max() + buffer_deg
+
+    min_lat = turbine_df["lat"].min() - buffer_deg
+    max_lat = turbine_df["lat"].max() + buffer_deg
+
+    # Convert lon/lat -> raster rows/cols
+    r0, c0 = rowcol(transform, min_lon, max_lat)
+    r1, c1 = rowcol(transform, max_lon, min_lat)
+
+    r0, r1 = sorted((r0, r1))
+    c0, c1 = sorted((c0, c1))
+
+    # Keep indices inside raster
+    r0 = max(r0, 0)
+    c0 = max(c0, 0)
+
+    r1 = min(r1, diff.shape[0])
+    c1 = min(c1, diff.shape[1])
+
+    # Mask invalid pixels
     mask = ~np.isfinite(diff)
-    diff = np.where(mask, 0, diff)
 
-    v = np.nanpercentile(np.abs(diff), 98)
-    if v == 0 or not np.isfinite(v):
-        v = 1.0
+    # Keep original diff for statistics
+    window = diff[r0:r1, c0:c1]
 
-    norm = mcolors.TwoSlopeNorm(vmin=-v, vcenter=0.0, vmax=v)
+    # --------------------------------------------------
+    # Compute colour scale only over OWF window
+    # --------------------------------------------------
+
+    valid = np.abs(window[np.isfinite(window)])
+    nonzero = valid[valid > 0]
+
+    if nonzero.size > 0:
+        # Normal case: real OWF differences exist
+        v = np.nanpercentile(nonzero, 98)
+
+    elif valid.size > 0:
+        # OWF exists but no detectable difference
+        v = 0.001
+
+    else:
+        # No valid OWF pixels: fallback to whole raster
+        valid_all = np.abs(diff[np.isfinite(diff)])
+        valid_all = valid_all[valid_all > 0]
+
+        if valid_all.size > 0:
+            v = np.nanpercentile(valid_all, 98)
+        else:
+            v = 0.001
+
+    # Avoid numerical problems
+    if not np.isfinite(v) or v == 0:
+        v = 0.001
+
+    # --------------------------------------------------
+    # Render
+    # --------------------------------------------------
+
+    norm = mcolors.TwoSlopeNorm(
+        vmin=-v,
+        vcenter=0.0,
+        vmax=v,
+    )
 
     cmap = matplotlib.colormaps.get_cmap("RdBu_r")
-    rgba = cmap(norm(diff))
+    rgba = cmap(norm(np.where(mask, 0, diff)))
 
     rgba = (rgba * 255).astype(np.uint8)
+
+    # Transparent invalid pixels
     rgba[mask, 3] = 0
-    return rgba
+
+    return rgba, v
 
 if "current_tif" not in st.session_state:
     st.session_state.current_tif = None
@@ -517,7 +754,7 @@ try:
 
     # Only reload if file actually changed
     if st.session_state.current_tif != tif_path:
-        rgba, bounds, _, vmin, vmax = _load_tif_cached(tif_path)
+        rgba, bounds, _, vmin, vmax = _load_tif_cached(tif_path, turbine_df)
 
         st.session_state.current_tif = tif_path
         st.session_state.rgba = rgba
@@ -647,7 +884,13 @@ colormap = cm.LinearColormap(
     vmin=vmin,
     vmax=vmax
 )
-colormap.caption = selected_var
+#colormap.caption = selected_var
+info = VARIABLE_INFO.get(
+    selected_var,
+    {"name": selected_var, "unit": "-"}
+)
+
+colormap.caption = f"{info['name']} ({info['unit']})"
 colormap.add_to(m)
         
 
@@ -661,168 +904,263 @@ if "selected_points" not in st.session_state:
 
 map_state = st_folium(m, use_container_width=True, height=700)
 if map_state is None:
-    st.stop()
+    map_state = {}
+    #st.stop()
 
-#st.subheader(f"Average Mussel biomass – {scenario}")
-st.subheader("Average Mussel biomass – Multi-scenario comparison")
+#st.success("Reached info section")
 
-if not is_last_time:
-    st.info("Move slider to latest time to view full analysis.")
-else:
-    # --- ALL YOUR EXISTING PLOTS GO HERE ---
+legend_col, info_col = st.columns([1, 2])
 
-    col1, col2 = st.columns(2)
+with legend_col:
 
-    with col1:
-        st.markdown("**Average biomass [kg/ind]**")
+    st.markdown("### Map information")
 
-        plot_df = pd.DataFrame()
+    st.write("✚ Offshore wind turbine foundation")
+    st.write("🔴 Low-trophic aquaculture unit")
+    st.write("🌈 Environmental variable (GeoTIFF)")
+    st.write("Color bar = value range")
 
-        for scen, df in all_avg_ts.items():
-            ts = df.set_index("time")[["value"]].rename(columns={"value": scen})
-            plot_df = ts if plot_df.empty else plot_df.join(ts, how="outer")
 
-        import altair as alt
+with info_col:
 
-        if plot_df.empty:
-            st.warning("No scenario data available.")
-        else:
-            plot_long = (
-                plot_df
-                .reset_index(names="time")
-                .melt(
-                    id_vars="time",
-                    var_name="scenario",
-                    value_name="value"
-               )
+    info = VARIABLE_INFO.get(
+        selected_var.lower(),
+        {
+            "name": selected_var,
+            "unit": "-",
+            "description": ""
+        }
+    )
+
+    st.markdown(f"### {info['name']}")
+
+    st.markdown(
+        f"**Variable:** `{selected_var}` — {info['name']}  \n"
+        f"**Unit:** {info['unit']}"
+    )
+    
+    st.write(info["description"])
+
+    st.divider()
+
+    st.markdown("### Current map")
+
+    st.write(f"**Dataset:** {selected_source}")
+
+    if selected_source == "Baseline":
+        st.write("**Scenario:** Baseline")
+    else:
+        st.write(f"**Scenario:** {folder_scenario}")
+
+    st.write(f"**Variable:** {selected_var}")
+
+    st.write(f"**Date:** {selected_row['time'].strftime('%Y-%m-%d')}")
+
+
+# --------------------------------------------------
+# Multi-scenario comparison
+# --------------------------------------------------
+
+st.subheader("Average mussel biomass – Multi-scenario comparison")
+
+selected_time_pd = pd.to_datetime(selected_time)
+
+col1, col2 = st.columns(2)
+
+# --------------------------------------------------
+# LEFT: time series (from t0 until selected time)
+# --------------------------------------------------
+
+with col1:
+
+    st.markdown("**Average biomass [kg/ind]**")
+
+    plot_df = pd.DataFrame()
+
+    for scen, df in all_avg_ts.items():
+
+        df = df.copy()
+        df["time"] = pd.to_datetime(df["time"])
+
+        # keep only data up to selected time
+        df = df[df["time"] <= selected_time_pd]
+
+        if df.empty:
+            continue
+
+        ts = (
+            df
+            .set_index("time")[["value"]]
+            .rename(columns={"value": scen})
+        )
+
+        plot_df = ts if plot_df.empty else plot_df.join(ts, how="outer")
+
+    import altair as alt
+
+    if plot_df.empty:
+
+        st.warning("No scenario data available for the selected time.")
+
+    else:
+
+        plot_long = (
+            plot_df
+            .reset_index(names="time")
+            .melt(
+                id_vars="time",
+                var_name="scenario",
+                value_name="value",
             )
-            #selected_scenarios = list(all_avg_ts.keys())
-            selected_scenarios = plot_long["scenario"].dropna().unique().tolist()
+        )
 
-            chart = alt.Chart(plot_long).mark_line().encode(
-                x="time:T",
-                #y="value:Q",
-                y=alt.Y(
-                    "value:Q",
-                    scale=alt.Scale(type="log"),
-                    title="Harvest biomass [kg/m²]"
+        selected_scenarios = (
+            plot_long["scenario"]
+            .dropna()
+            .unique()
+            .tolist()
+        )
+
+        chart = alt.Chart(plot_long).mark_line().encode(
+
+            x=alt.X("time:T", title="Time"),
+
+            y=alt.Y(
+                "value:Q",
+                scale=alt.Scale(type="log"),
+                title="Average biomass [kg individual⁻¹]",
+            ),
+
+            color=alt.Color(
+                "scenario:N",
+                scale=alt.Scale(
+                    domain=selected_scenarios,
+                    range=[
+                        SCENARIO_COLORS.get(s, "#808080")
+                        for s in selected_scenarios
+                    ],
                 ),
-                color=alt.Color(
-                        "scenario:N",
-                    scale=alt.Scale(
-                        domain=selected_scenarios,
-                        #range=[SCENARIO_COLORS[s] for s in selected_scenarios]
-                        range=[SCENARIO_COLORS.get(s, "#808080") for s in selected_scenarios
-]
-                    ),
-                    legend=alt.Legend(title="Scenario")
-                )
-            )
+                legend=alt.Legend(title="Scenario"),
+            ),
+        )
 
-            #st.altair_chart(chart, width="stretch")
-            st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(chart, use_container_width=True)
 
-    with col2:
-        st.markdown("**Estimated mussel harvest [kg]**")
+# --------------------------------------------------
+# RIGHT: harvest at selected time
+# --------------------------------------------------
 
-        selected_time_pd = pd.to_datetime(selected_time)
+with col2:
 
-        bar_data = {}
+    st.markdown("**Estimated mussel harvest [kg]**")
 
-        for scen, df in all_avg_ts.items():
-            df_clean = df.dropna(subset=["time", "value"])
+    bar_data = {}
 
-            if df_clean.empty:
-                continue
+    for scen, df in all_avg_ts.items():
 
-            idx = (df_clean["time"] - selected_time_pd).abs().idxmin()
-            row = df_clean.loc[idx]
+        df = df.copy()
+        df["time"] = pd.to_datetime(df["time"])
 
-            bar_data[scen] = row["harvest"]
+        # keep only data up to selected time
+        df = df[df["time"] <= selected_time_pd]
 
-        #bar_df = pd.DataFrame.from_dict(bar_data, orient="index", columns=["Harvest"])
-        #bar_long = bar_df.reset_index().rename(columns={"index": "scenario"})
+        if df.empty:
+            continue
+
+        # take the latest available row up to selected time
+        row = df.sort_values("time").iloc[-1]
+
+        bar_data[scen] = row["harvest"]
+
+    if not bar_data:
+
+        st.warning("No harvest data available for the selected time.")
+
+    else:
+
         bar_df = pd.DataFrame.from_dict(
             bar_data,
             orient="index",
-            columns=["Harvest"]
+            columns=["Harvest"],
         )
 
         bar_long = (
-            bar_df.reset_index()
+            bar_df
+            .reset_index()
             .rename(columns={"index": "scenario"})
         )
 
         selected_scenarios = list(bar_data.keys())
 
         chart = alt.Chart(bar_long).mark_bar().encode(
-            x="scenario:N",
-            y="Harvest:Q",
+
+            x=alt.X("scenario:N", title="Scenario"),
+
+            y=alt.Y(
+                "Harvest:Q",
+                title="Estimated harvest biomass [kg]",
+            ),
+
             color=alt.Color(
                 "scenario:N",
                 scale=alt.Scale(
                     domain=selected_scenarios,
-                    range=[SCENARIO_COLORS[s] for s in selected_scenarios]
+                    range=[
+                        SCENARIO_COLORS.get(s, "#808080")
+                        for s in selected_scenarios
+                    ],
                 ),
-                legend=alt.Legend(title="Scenario")
-            )
+                legend=alt.Legend(title="Scenario"),
+            ),
         )
 
-        st.altair_chart(chart, use_container_width=True)        
+        st.altair_chart(chart, use_container_width=True)
 
     # =========================
 # GEO-TIFF DIFFERENCE MAP
 # =========================
 
-st.subheader("Scenario − Reference difference")
+st.subheader("Scenario − ScenM0 (biology baseline) difference")
 
-if scenario is None:
-    st.info("Select a scenario to compute difference.")
+if selected_source != "Scenario":
+    st.info("Switch to the Scenario dataset to compute differences.")
+
+elif scenario is None:
+    st.info("Select a scenario to compute differences.")
+
 else:
     try:
-        # --- current scenario tif ---
+        # --------------------------------------------------
+        # Current scenario GeoTIFF
+        # --------------------------------------------------
+
         scen_path = Path(selected_tif)
         scen_bytes = scen_path.read_bytes()
 
-        scen_rgba, scen_bounds, _, _, _ = _load_tif_cached(str(scen_path))
-
-        # --- choose reference tif (simple baseline: first file of variable) ---
-        #ref_file = df_files[df_files["variable"] == selected_var].sort_values("time").iloc[0]["file"]
+        scen_rgba, scen_bounds, _, _, _ = _load_tif_cached(str(scen_path), turbine_df)
 
         scenario_time = pd.Timestamp(selected_row["time"])
 
-# --------------------------------------------------
-# Select the reference raster
-# --------------------------------------------------
+        # --------------------------------------------------
+        # Reference GeoTIFF = ScenM0
+        # --------------------------------------------------
 
-        if selected_source == "Baseline":
-
-    # Physics reference
-            ref_df = df_files[
-                (df_files["variable"] == selected_var) &
-                (df_files["source"] == "Baseline")
-            ].copy()
-
-        else:
-
-    # Biology reference = ScenM0
-            ref_df = df_files[
-                (df_files["variable"] == selected_var) &
-                (df_files["source"] == "Scenario") &
-                (df_files["scenario"] == "ScenM0")
-            ].copy()
+        ref_df = df_files[
+            (df_files["variable"] == selected_var) &
+            (df_files["source"] == "Scenario") &
+            (df_files["scenario"] == "ScenM0")
+        ].copy()
 
         if ref_df.empty:
             st.error(
-                f"No reference GeoTIFF found.\n"
-                f"variable={selected_var}\n"
-                f"source={selected_source}"
-            ) 
+                f"No ScenM0 reference GeoTIFF found.\n"
+                f"Variable = {selected_var}"
+            )
             st.stop()
 
-# --------------------------------------------------
-# Match the nearest timestamp
-# --------------------------------------------------
+        # --------------------------------------------------
+        # Match nearest timestamp
+        # --------------------------------------------------
 
         ref_df["time"] = pd.to_datetime(ref_df["time"])
 
@@ -833,32 +1171,31 @@ else:
         ref_file = ref_row["file"]
         ref_bytes = ref_file.read_bytes()
 
-# ---------- TEMPORARY DEBUG ----------
-        st.write(
-            f"Scenario TIFF: {Path(selected_tif).name}"
-        )
-        st.write(
-            f"Reference TIFF: {Path(ref_file).name}"
-        )
-        st.write(
-            f"Scenario time: {scenario_time}"
-        )
-        st.write(
-            f"Reference time: {ref_row['time']}"
-        )
+        # ---------- TEMPORARY DEBUG ----------
+        st.write(f"Scenario TIFF : {Path(selected_tif).name}")
+        st.write(f"Reference TIFF: {Path(ref_file).name}")
+        st.write(f"Scenario time : {scenario_time}")
+        st.write(f"Reference time: {ref_row['time']}")
 
+        # --------------------------------------------------
+        # Read + align rasters
+        # --------------------------------------------------
 
-        # --- read + align rasters ---
         with MemoryFile(scen_bytes) as mem_s:
             with mem_s.open() as src_s:
 
                 with MemoryFile(ref_bytes) as mem_r:
                     with mem_r.open() as src_r:
 
-                        scen = _clean(src_s.read(1), src_s)
-                        ref  = _clean(src_r.read(1), src_r)
-
-                        ref_aligned = np.full_like(scen, np.nan, dtype=np.float32)
+                        #scen = _clean(src_s.read(1), src_s)
+                        #ref = _clean(src_r.read(1), src_r)
+                        scen = _clean(src_s.read(1), src_s, selected_var)
+                        ref  = _clean(src_r.read(1), src_r, selected_var)
+                        ref_aligned = np.full_like(
+                            scen,
+                            np.nan,
+                            dtype=np.float32,
+                        )
 
                         reproject(
                             source=ref,
@@ -869,18 +1206,41 @@ else:
                             dst_crs=src_s.crs,
                             resampling=Resampling.bilinear,
                         )
+                        
+                        transform = src_s.transform
 
-        # --- diff ---
+        # --------------------------------------------------
+        # Compute difference
+        # --------------------------------------------------
+
         diff = scen - ref_aligned
-        diff_rgba = _render_diff_rgba(diff)
+
+        valid = np.isfinite(diff)
+
+        diff_smooth = diff.copy()
+        diff_smooth[~valid] = 0
+
+        diff_smooth = gaussian_filter(
+            diff_smooth,
+            sigma=1.0,
+        )
+
+        diff_smooth[~valid] = np.nan
+
+        diff_rgba, v = _render_diff_rgba(
+            diff_smooth,
+            src_s.transform,
+            turbine_df,
+        )
 
         south, west, north, east = scen_bounds
 
         diff_map = folium.Map(
-            location=[(south + north) / 2, (west + east) / 2],
-            zoom_start=8,
             tiles="OpenStreetMap",
+            control_scale=True,
         )
+
+        folium.FitBounds(final_bounds).add_to(diff_map)
 
         folium.raster_layers.ImageOverlay(
             image=_rgba_to_data_url(diff_rgba),
@@ -888,15 +1248,37 @@ else:
             opacity=0.75,
         ).add_to(diff_map)
 
+        diff_colormap = cm.LinearColormap(
+            colors=[
+                "#2166ac",
+                "#67a9cf",
+                "#f7f7f7",
+                "#ef8a62",
+                "#b2182b",
+            ],
+            vmin=-v,
+            vmax=v,
+        )
+
+        
+        diff_colormap.caption = (
+            f"{info['name']} difference ({folder_scenario} − ScenM0) [{info['unit']}]"
+        )
+        diff_colormap.add_to(diff_map)
+
         folium.LayerControl().add_to(diff_map)
 
-        st_folium(diff_map, use_container_width=True, height=550)
+        st_folium(
+            diff_map,
+            use_container_width=True,
+            height=550,
+        )
 
-        st.caption("🔴 higher than reference | 🔵 lower than reference")
+        st.caption("🔴 Higher than ScenM0   |   🔵 Lower than ScenM0")
 
     except Exception as e:
         st.warning(f"Could not compute GeoTIFF difference: {e}")    
-    
+
 if ts_df.empty:
     st.warning("No valid `value` and `time` entries found in GeoJSON.")
 else:
@@ -942,10 +1324,12 @@ else:
     else:
         st.warning("No point data available.")
         st.stop()
-    point_ts = ts_df[
-        (np.isclose(ts_df["lon"], selected_lon)) &
-        (np.isclose(ts_df["lat"], selected_lat))
+    point_ts = ts_df_current[
+        (np.isclose(ts_df_current["lon"], selected_lon)) &
+        (np.isclose(ts_df_current["lat"], selected_lat))
     ].copy()
+
+
     #bad = point_ts[~point_ts["time"].astype(str).str.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")]
     #st.write("Bad format:", bad["time"].unique())
 # Also catch invalid dates like month=00
@@ -957,27 +1341,31 @@ else:
     time_num = pd.to_numeric(point_ts["time"], errors="coerce")
     if time_num.notna().all():
         point_ts = point_ts.assign(_time_num=time_num).sort_values("_time_num").drop(columns=["_time_num"])
-
     plot_df = pd.DataFrame()
 
     for lon_sel, lat_sel in st.session_state.selected_points:
-        #ts = ts_df[(np.isclose(ts_df["lon"], lon_sel)) & (np.isclose(ts_df["lat"], lat_sel))].copy()
-        tol = 1e-5
-        ts = ts_df[
-            (np.abs(ts_df["lon"] - lon_sel) < tol) &
-            (np.abs(ts_df["lat"] - lat_sel) < tol)
-        ].copy()
-        if ts.empty:
-           continue
 
-        ts["time"] = pd.to_datetime(ts["time"])
+        tol = 1e-5
+
+        ts = ts_df_current[
+            (np.abs(ts_df_current["lon"] - lon_sel) < tol) &
+            (np.abs(ts_df_current["lat"] - lat_sel) < tol)
+        ].copy()
+
+        if ts.empty:
+            continue
+
         ts = ts.sort_values("time")
 
         label = f"{lon_sel:.3f},{lat_sel:.3f}"
-        ts = ts.set_index("time")[["value"]].rename(columns={"value": label})
+
+        ts = (
+            ts.set_index("time")[["value"]]
+              .rename(columns={"value": label})
+        )
 
         plot_df = ts if plot_df.empty else plot_df.join(ts, how="outer")
-
+    
     #chart_container.warning("No time series found for selected points")
     chart_container = st.empty()
 
@@ -985,9 +1373,9 @@ else:
 
         missing_points = len(st.session_state.selected_points)
 
-        chart_container.warning(
-            f"No time series found for {missing_points} selected point(s)"
-        )
+#        chart_container.warning(
+ #           f"No time series found for {missing_points} selected point(s)"
+  #      )
 
     else:
         chart_container.line_chart(plot_df, height=300)
