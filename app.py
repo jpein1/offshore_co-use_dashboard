@@ -1,13 +1,8 @@
-# Public EDITO/MinIO integration of the original OWF & LTA dashboard.\n# Existing UI, maps, plots and analysis are retained; local object\n# discovery/reads are replaced by deterministic HTTPS access.\n\nimport base64
+import base64
 import io
 import json
-import os
-from datetime import timedelta
 from pathlib import Path
 from typing import Tuple
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
 
 import folium
 import matplotlib
@@ -233,182 +228,7 @@ def _render_preview_from_tif(
     return rgba, (south, west, north, east), style, vmin, vmax
     #vmin, vmax = 0, 255
 
-# ------------------------------------------------------------------
-# PUBLIC EDITO / MINIO DATA ACCESS
-# ------------------------------------------------------------------
-
-PUBLIC_OBJECT_BASE_URL = os.getenv(
-    "PUBLIC_OBJECT_BASE_URL",
-    "https://minio.dive.edito.eu/project-foccus",
-).rstrip("/")
-
-PROJECT_PREFIX = os.getenv(
-    "PROJECT_PREFIX",
-    "Hereon/ESC2_blue_economy",
-).strip("/")
-
-DATA_INTERVAL_HOURS = float(os.getenv("DATA_INTERVAL_HOURS", "1"))
-DATA_START = os.getenv("DATA_START", "2020-05-01T00:00:00")
-DATA_END = os.getenv("DATA_END", "2020-05-31T23:00:00")
-
-REFERENCE_SCENARIO = "ScenM0"
-
-REMOTE_VARIABLE_MAP = {
-    "chla": "chla",
-    "chlorophyll": "chla",
-    "oxy": "oxy",
-    "oxygen": "oxy",
-    "salt": "salt",
-    "salinity": "salt",
-    "temp": "temp",
-    "temperature": "temp",
-    "mussel_weight": "mussel_weight",
-}
-
-REMOTE_VARIABLE_CANDIDATES = [
-    "chla",
-    "oxy",
-    "salt",
-    "temp",
-    "mussel_weight",
-]
-
-
-def public_project_url(relative_key: str) -> str:
-    relative_key = relative_key.lstrip("/")
-    return (
-        f"{PUBLIC_OBJECT_BASE_URL}/{PROJECT_PREFIX}/"
-        f"{quote(relative_key, safe='/')}"
-    )
-
-
-def geotiff_url(scenario: str, variable: str, timestamp) -> str:
-    timestamp_string = pd.Timestamp(timestamp).strftime("%Y%m%dT%H%M%S")
-    remote_variable = REMOTE_VARIABLE_MAP.get(variable, variable)
-    return public_project_url(
-        f"geotiff/{scenario}/{remote_variable}_{timestamp_string}.tif"
-    )
-
-
-def csv_url(filename: str) -> str:
-    return public_project_url(filename)
-
-
-def geojson_url(filename: str) -> str:
-    return public_project_url(f"geojson/{filename}")
-
-
-def _http_request(url: str, method: str = "GET", timeout: int = 60):
-    request = Request(
-        url,
-        method=method,
-        headers={"User-Agent": "OWF-LTA-CoUse-Streamlit-App/1.0"},
-    )
-    return urlopen(request, timeout=timeout)
-
-
-@st.cache_data(show_spinner=False)
-def public_object_exists(url: str) -> bool:
-    try:
-        with _http_request(url, method="HEAD") as response:
-            return 200 <= response.status < 300
-    except HTTPError as exc:
-        if exc.code in (404, 410):
-            return False
-        if exc.code not in (400, 403, 405):
-            return False
-    except (URLError, TimeoutError, OSError):
-        return False
-
-    try:
-        with _http_request(url, method="GET") as response:
-            response.read(1)
-            return 200 <= response.status < 300
-    except (HTTPError, URLError, TimeoutError, OSError):
-        return False
-
-
-@st.cache_data(show_spinner=False)
-def download_public_object(url: str) -> bytes:
-    with _http_request(url, method="GET") as response:
-        return response.read()
-
-
-@st.cache_data(show_spinner=False)
-def read_public_json(url: str):
-    return json.loads(download_public_object(url).decode("utf-8"))
-
-
-def generate_timestamps(start_string: str, end_string: str):
-    start = pd.Timestamp(start_string).to_pydatetime()
-    end = pd.Timestamp(end_string).to_pydatetime()
-    step = timedelta(hours=DATA_INTERVAL_HOURS)
-    current = start
-    while current <= end:
-        yield current
-        current += step
-
-
-@st.cache_data(show_spinner=False)
-def find_available_timestamps(
-    variable: str,
-    scenario_folder: str,
-    start_string: str = DATA_START,
-    end_string: str = DATA_END,
-) -> list:
-    found = []
-    for timestamp in generate_timestamps(start_string, end_string):
-        url = geotiff_url(scenario_folder, variable, timestamp)
-        if public_object_exists(url):
-            found.append(
-                {
-                    "file": url,
-                    "url": url,
-                    "variable": variable,
-                    "time": pd.Timestamp(timestamp),
-                    "source": "Scenario",
-                    "scenario": scenario_folder,
-                }
-            )
-    return found
-
-
-@st.cache_data(show_spinner=False)
-def build_remote_file_index(
-    variable: str,
-    source: str,
-    scenario_folder: str,
-) -> pd.DataFrame:
-    records = find_available_timestamps(
-        variable,
-        scenario_folder,
-        DATA_START,
-        DATA_END,
-    )
-    if not records:
-        return pd.DataFrame(
-            columns=["file", "url", "variable", "time", "source", "scenario"]
-        )
-
-    df = pd.DataFrame(records)
-    df["source"] = source
-    return df.sort_values("time").reset_index(drop=True)
-
-
-@st.cache_data(show_spinner=False)
-def available_remote_variables(source: str, scenario_folder: str) -> list:
-    found = []
-    for variable in REMOTE_VARIABLE_CANDIDATES:
-        if not build_remote_file_index(
-            variable, source, scenario_folder
-        ).empty:
-            found.append(variable)
-    return found
-
-
-def _load_geojson_timeseries(geojson_url_string: str) -> pd.DataFrame:
-    payload = read_public_json(geojson_url_string)
-
+def _load_geojson_timeseries(geojson_path: Path) -> pd.DataFrame:
     payload = json.loads(geojson_path.read_text(encoding="utf-8"))
     features = payload.get("features", [])
     rows = []
@@ -442,8 +262,8 @@ def _load_geojson_timeseries(geojson_url_string: str) -> pd.DataFrame:
     return df
     
 @st.cache_data(show_spinner=False)
-def _cached_load_geojson_timeseries(url: str) -> pd.DataFrame:
-    return _load_geojson_timeseries(url)
+def _cached_load_geojson_timeseries(path_str: str) -> pd.DataFrame:
+    return _load_geojson_timeseries(Path(path_str))
 
 
 def _select_nearest_point(points_df: pd.DataFrame, click_lon: float, click_lat: float) -> pd.Series:
@@ -505,26 +325,34 @@ Hydrodynamic forcing
 → Interactive visualization in Streamlit.
 """)
 
-with st.expander("Data source", expanded=False):
-    st.write("Public EDITO/MinIO object store:", public_project_url(""))
-    st.write(
-        "GeoTIFF time range:",
-        f"{DATA_START} → {DATA_END} "
-        f"(every {DATA_INTERVAL_HOURS:g} hour(s))",
-    )
-
-# ------------------------------------------------------------------
-# Public EDITO object names
-# ------------------------------------------------------------------
+base_dir = Path(__file__).parent
 
 geojson_files = {
-    "Scenario 1": "harvest_timeseries_scenario_Scen_M2.geojson",
-    "Scenario 2": "harvest_timeseries_scenario_Scen_M3.geojson",
-    "Scenario N": "harvest_timeseries_scenario_Scen_N.geojson",
-    "Scenario E": "harvest_timeseries_scenario_Scen_E.geojson",
-    "Scenario S": "harvest_timeseries_scenario_Scen_S.geojson",
-    "Scenario W": "harvest_timeseries_scenario_Scen_W.geojson",
+    "Scenario 1": base_dir / "harvest_timeseries_scenario_Scen_M2.geojson",
+    "Scenario 2": base_dir / "harvest_timeseries_scenario_Scen_M3.geojson",
+    "Scenario N": base_dir / "harvest_timeseries_scenario_Scen_N.geojson",
+    "Scenario E": base_dir / "harvest_timeseries_scenario_Scen_E.geojson",
+    "Scenario S": base_dir / "harvest_timeseries_scenario_Scen_S.geojson",
+    "Scenario W": base_dir / "harvest_timeseries_scenario_Scen_W.geojson",
+   # "Scenario 3": base_dir / "scenario3.geojson",
 }
+
+# --- Scan all tif files and organize ---
+#tif_files = sorted((base_dir / "geotiff").glob("**/*.tif"))
+# --- Scan all tif files and organize ---
+
+tif_dirs = {
+    "scenario": base_dir / "geotiff",
+    "baseline_salt": base_dir / "salt_geotiff_ScenM0",
+    "baseline_temp": base_dir / "temp_geotiff_ScenM0",
+}
+
+tif_files = []
+
+for folder in tif_dirs.values():
+    if folder.exists():
+        tif_files.extend(sorted(folder.glob("**/*.tif")))
+
 
 SCENARIO_TO_FOLDER = {
     "Scenario 1": "ScenM2",
@@ -538,16 +366,11 @@ SCENARIO_TO_FOLDER = {
 # --- wind turbine locations ---
 
 
-turbine_csv = csv_url("Meerwind_monopiles_lonlat.csv")
+turbine_csv = base_dir / "Meerwind_monopiles_lonlat.csv"
 
 @st.cache_data(show_spinner=False)
-def load_turbines(csv_url_string):
-    df = pd.read_csv(
-        io.BytesIO(download_public_object(csv_url_string)),
-        header=None,
-        sep=r"\s+",
-        engine="python",
-    )
+def load_turbines(csv_path):
+    df = pd.read_csv(csv_path, header=None, sep=r"\s+", engine="python")
     df = df.iloc[:, :2]
     df.columns = ["lon", "lat"]
 
@@ -560,30 +383,47 @@ turbine_df = load_turbines(turbine_csv)
 
 records = []
 
-# No bucket listing is used: each expected timestamp is probed directly.
-for folder in [REFERENCE_SCENARIO] + list(SCENARIO_TO_FOLDER.values()):
-    for variable in REMOTE_VARIABLE_CANDIDATES:
-        df_remote = build_remote_file_index(
-            variable,
-            "Scenario",
-            folder,
-        )
-        if not df_remote.empty:
-            records.extend(df_remote.to_dict("records"))
+for f in tif_files:
 
+    name = f.stem
+    folder = f.parent.name          # <-- NEW
+
+    try:
+        var, tstr = name.rsplit("_", 1)
+        time = pd.to_datetime(tstr, format="%Y%m%dT%H%M%S")
+
+        # detect source type
+        if "salt_geotiff_ScenM0" in folder:
+            source = "Baseline"
+            scenario_name = "Baseline"
+
+        elif "temp_geotiff_ScenM0" in folder:
+            source = "Baseline"
+            scenario_name = "Baseline"
+
+        else:
+            source = "Scenario"
+
+            # everything after "..._geotiff_"
+            scenario_name = folder.split("_geotiff_")[-1]
+
+        records.append(
+            {
+                "file": f,
+                "variable": var,
+                "time": time,
+                "source": source,
+                "scenario": scenario_name,      # <-- NEW
+            }
+        )
+
+    except Exception:
+        continue
 if not records:
-    st.error(
-        "No public GeoTIFFs were found in the configured EDITO/MinIO "
-        "time range. Check DATA_START/DATA_END and the public object path."
-    )
+    st.error("No valid tif files found.")
     st.stop()
 
-df_files = (
-    pd.DataFrame(records)
-    .drop_duplicates(subset=["url"])
-    .sort_values("time")
-    .reset_index(drop=True)
-)
+df_files = pd.DataFrame(records).sort_values("time")
 
 #variables = sorted(df_files["variable"].unique())
 
@@ -604,24 +444,10 @@ with st.sidebar:
         source_options
     )
    
-    if selected_source == "Baseline":
-        probe_scenario = REFERENCE_SCENARIO
-    else:
-        probe_scenario = (
-            SCENARIO_TO_FOLDER.get(scenario, REFERENCE_SCENARIO)
-            if scenario is not None
-            else REFERENCE_SCENARIO
-        )
-
-    variables = [
-        v for v in REMOTE_VARIABLE_CANDIDATES
-        if v in available_remote_variables("Scenario", probe_scenario)
-    ]
-
-    if not variables:
-        st.error("No supported public variables are available for this selection.")
-        st.stop()
-
+    variables = sorted(
+        df_files[df_files["source"] == selected_source]["variable"].unique()
+    )
+    
     selected_var = st.selectbox("Variable", variables)
 
     scenario = st.selectbox(
@@ -711,7 +537,7 @@ with st.sidebar:
 
 
 
-    st.write("Selected file:", selected_tif.rsplit("/", 1)[-1])
+    st.write("Selected file:", selected_tif.name)
 
     
     opacity = st.slider("TIFF overlay opacity", 0.0, 1.0, 0.75, 0.05)
@@ -751,13 +577,13 @@ if selected_source == "Scenario":
         st.info("Select a scenario to display GeoJSON points and time series.")
 
     else:
-        geojson_path = geojson_url(geojson_files[scenario])
+        geojson_path = geojson_files[scenario]
 
-        if not public_object_exists(geojson_path):
-            st.error(f"Public GeoJSON file not found: {geojson_path}")
+        if not geojson_path.exists():
+            st.error(f"GeoJSON file not found: {geojson_path}")
 
         else:
-            ts_df = _cached_load_geojson_timeseries(geojson_path)
+            ts_df = _cached_load_geojson_timeseries(str(geojson_path))
 
             if not ts_df.empty:
                 ts_df["time"] = pd.to_datetime(ts_df["time"])
@@ -790,12 +616,12 @@ all_avg_ts = {}
 
 for scen in st.session_state.selected_scenarios:
 
-    geojson_path = geojson_url(geojson_files[scen])
+    geojson_path = geojson_files[scen]
 
-    if not public_object_exists(geojson_path):
+    if not geojson_path.exists():
         continue
 
-    ts_df_tmp = _cached_load_geojson_timeseries(geojson_path)
+    ts_df_tmp = _cached_load_geojson_timeseries(str(geojson_path))
 
     if ts_df_tmp.empty:
         continue
@@ -823,8 +649,9 @@ for scen in st.session_state.selected_scenarios:
     all_avg_ts[scen] = avg_tmp
 
 @st.cache_data(show_spinner=False)
-def _load_tif_cached(url: str, turbine_df):
-    tif_bytes = download_public_object(url)
+def _load_tif_cached(path_str: str, turbine_df):
+    path = Path(path_str)
+    tif_bytes = path.read_bytes()
     return _render_preview_from_tif(tif_bytes, turbine_df, max_size=1024)
     
 #def _render_diff_rgba(diff: np.ndarray) -> np.ndarray:
@@ -942,7 +769,7 @@ try:
     vmax = st.session_state.vmax
 
 except Exception as e:
-    st.error(f"Failed to read/render public GeoTIFF: {e}")
+    st.error(f"Failed to read/render local GeoTIFF: {e}")
     st.stop()
 
       
@@ -1307,13 +1134,10 @@ else:
         # Current scenario GeoTIFF
         # --------------------------------------------------
 
-        scen_url = selected_tif
-        scen_bytes = download_public_object(scen_url)
+        scen_path = Path(selected_tif)
+        scen_bytes = scen_path.read_bytes()
 
-        scen_rgba, scen_bounds, _, _, _ = _load_tif_cached(
-            scen_url,
-            turbine_df,
-        )
+        scen_rgba, scen_bounds, _, _, _ = _load_tif_cached(str(scen_path), turbine_df)
 
         scenario_time = pd.Timestamp(selected_row["time"])
 
@@ -1345,11 +1169,11 @@ else:
         ref_row = ref_df.loc[idx_ref]
 
         ref_file = ref_row["file"]
-        ref_bytes = download_public_object(ref_file)
+        ref_bytes = ref_file.read_bytes()
 
         # ---------- TEMPORARY DEBUG ----------
-        st.write(f"Scenario TIFF : {selected_tif.rsplit('/', 1)[-1]}")
-        st.write(f"Reference TIFF: {ref_file.rsplit('/', 1)[-1]}")
+        st.write(f"Scenario TIFF : {Path(selected_tif).name}")
+        st.write(f"Reference TIFF: {Path(ref_file).name}")
         st.write(f"Scenario time : {scenario_time}")
         st.write(f"Reference time: {ref_row['time']}")
 
@@ -1405,7 +1229,7 @@ else:
 
         diff_rgba, v = _render_diff_rgba(
             diff_smooth,
-            transform,
+            src_s.transform,
             turbine_df,
         )
 
